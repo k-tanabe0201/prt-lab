@@ -1,0 +1,29 @@
+# Actions event policy で pull_request_target を許可する対象（段階 B）。文脈を出すだけで、トークンの権限は持たない。
+# 同じファイルの push と workflow_dispatch は、許可リストに書かないイベントがどうなるかを見るために置く。
+name: prt-allow
+
+on:
+  pull_request_target:
+  push:
+    branches: [claude/project-thread-ka38w2]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  show:
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.user.login == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Show context
+        env:
+          ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "event=$GITHUB_EVENT_NAME action=$ACTION"
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "pr=$PR_NUMBER head_sha=$HEAD_SHA"
+          echo "image=$ImageOS/$ImageVersion"

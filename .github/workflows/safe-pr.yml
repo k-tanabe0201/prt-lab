@@ -1,0 +1,36 @@
+# 書き換え後の前半: pull_request で PR のマージコミットを読み、結果（数字だけ）を artifact に上げる。
+# トークンは読み取りだけ。書き込みは safe-comment（workflow_run）に任せる。
+name: safe-pr
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  count:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Count changed files
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/lab-result"
+          files=$(git diff --name-only HEAD^1 HEAD | wc -l)
+          echo "$files" > "$RUNNER_TEMP/lab-result/files.txt"
+          echo "$PR_NUMBER" > "$RUNNER_TEMP/lab-result/pr.txt"
+          echo "event=$GITHUB_EVENT_NAME GITHUB_REF=$GITHUB_REF GITHUB_SHA=$GITHUB_SHA files=$files pr=$PR_NUMBER"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lab-result
+          path: ${{ runner.temp }}/lab-result/
+          retention-days: 7
