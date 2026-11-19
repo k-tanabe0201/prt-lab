@@ -47,7 +47,7 @@ jobs:
     steps:
       - name: Collect this repository
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           echo "::stop-commands::$(uuidgen)"
           [[ "$PHASE" =~ ^[A-Za-z0-9_-]{1,20}$ ]] || { echo "bad phase"; exit 1; }
           [[ -z "$PR" || "$PR" =~ ^[0-9]{1,8}$ ]] || { echo "bad pr"; exit 1; }
@@ -56,13 +56,12 @@ jobs:
           OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"; F="$OUT/$PHASE.tsv"
           C='def c: tostring | gsub("[\\t\\r\\n]+"; " ") | .[0:400];'
           rate() { gh api rate_limit --jq "\"RATE\t$1\t\(.resources.core.limit)\t\(.resources.core.remaining)\t\(.resources.core.used)\"" | tee -a "$F"; }
-          html() { # ログインなしで見える公開の実行ページから、関係しそうな文だけを抜く
-            curl -sSL --max-time 20 -A "prt-lab-collect" "$GITHUB_SERVER_URL/$R/actions/runs/$1" 2>/dev/null \
-              | sed 's/<[^>]*>/\n/g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-              | grep -iE 'not allowed|pull_request_target|polic|evaluat|block|warn|annotation' \
-              | grep -viE 'privacy|cookie|terms|security policy|copilot|enterprise-grade|^\{|^\[' \
-              | awk 'length($0) < 400' | sort -u | head -20 \
-              | sed "s/^/HTML\t$1\t/" | tee -a "$F"
+          html() { # ログインなしで見える公開の実行ページから、アノテーションの欄と関係しそうな文だけを抜く（$1=リポジトリ $2=実行 ID $3=行頭）
+            curl -sSL --max-time 20 -A "prt-lab-collect" "$GITHUB_SERVER_URL/$1/actions/runs/$2" 2>/dev/null \
+              | tr '\r\n' '  ' | sed 's/<[^>]*>/\n/g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' \
+              | awk '/^Annotations$/ {f++; n=0} f == 1 && n < 14 {print; n++} f != 1 && /not allowed|pull_request_target|evaluate mode|enforce|^[0-9]+ (warning|error|notice)s?$/ {print}' \
+              | grep -viE 'privacy|cookie|terms|security policy|copilot' | awk 'length($0) < 400 && !seen[$0]++' | head -24 \
+              | sed "s/^/$3\t$2\t/"
           }
           echo "META	$PHASE	$(date -u +%Y-%m-%dT%H:%M:%SZ)	since=$SINCE	pr=$PR	image=$ImageOS/$ImageVersion	$(gh --version | head -1)" | tee -a "$F"
           rate start
@@ -76,7 +75,7 @@ jobs:
 
           if [[ -n "$SINCE" ]]; then
             gh api -X GET --paginate "repos/$R/actions/runs" -f per_page=100 -f created=">=$SINCE" \
-              --jq '.workflow_runs[] | [.id, .name, .path, .event, .status, (.conclusion // ""), .created_at, (.run_started_at // ""), .updated_at, .head_sha, .head_branch, .check_suite_id, .run_attempt, ([.pull_requests[]?.number | tostring] | join(","))] | @tsv' \
+              --jq '.workflow_runs[] | select(.name != "collect") | [.id, .name, .path, .event, .status, (.conclusion // ""), .created_at, (.run_started_at // ""), .updated_at, .head_sha, .head_branch, .check_suite_id, .run_attempt, ([.pull_requests[]?.number | tostring] | join(","))] | @tsv' \
               | sort -n > "$RUNNER_TEMP/runs.tsv"
             echo "runs: $(wc -l < "$RUNNER_TEMP/runs.tsv")"
             nhtml=0
@@ -94,8 +93,8 @@ jobs:
                 gh api "repos/$R/check-runs/$cid/annotations?per_page=100" \
                   | jq -r --arg run "$id" --arg cid "$cid" "$C"' .[] | ["ANN", $run, $cid, .annotation_level, ((.title // "") | c), ((.message // "") | c), (.path // ""), (.start_line | tostring)] | @tsv' | tee -a "$F"
               done
-              if [[ "$event" == "pull_request_target" || "$njobs" == "0" ]] && (( nhtml < 15 )); then
-                html "$id"; nhtml=$((nhtml + 1))
+              if (( nhtml < 60 )); then
+                html "$R" "$id" HTML | tee -a "$F"; nhtml=$((nhtml + 1))
               fi
             done 3< "$RUNNER_TEMP/runs.tsv"
           fi
@@ -115,10 +114,17 @@ jobs:
       - name: Survey brownout (public data)
         if: inputs.survey
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           echo "::stop-commands::$(uuidgen)"
           OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"; F="$OUT/$PHASE-survey.tsv"
           C='def c: tostring | gsub("[\\t\\r\\n]+"; " ") | .[0:400];'
+          html() { # ログインなしで見える公開の実行ページから、アノテーションの欄と関係しそうな文だけを抜く（$1=リポジトリ $2=実行 ID $3=行頭）
+            curl -sSL --max-time 20 -A "prt-lab-collect" "$GITHUB_SERVER_URL/$1/actions/runs/$2" 2>/dev/null \
+              | tr '\r\n' '  ' | sed 's/<[^>]*>/\n/g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' \
+              | awk '/^Annotations$/ {f++; n=0} f == 1 && n < 14 {print; n++} f != 1 && /not allowed|pull_request_target|evaluate mode|enforce|^[0-9]+ (warning|error|notice)s?$/ {print}' \
+              | grep -viE 'privacy|cookie|terms|security policy|copilot' | awk 'length($0) < 400 && !seen[$0]++' | head -24 \
+              | sed "s/^/$3\t$2\t/"
+          }
           REPOS=(nodejs/node NixOS/nixpkgs home-assistant/core DefinitelyTyped/DefinitelyTyped microsoft/vscode python/cpython
                  flutter/flutter godotengine/godot grafana/grafana apache/airflow pytorch/pytorch vercel/next.js
                  kubernetes/website ansible/ansible Homebrew/homebrew-core microsoft/TypeScript)
@@ -179,14 +185,9 @@ jobs:
                   api "repos/$repo/check-runs/$cid/annotations?per_page=50" 2>/dev/null \
                     | jq -r --arg rid "$rid" --arg run "$id" "$C"' .[] | ["SANN", $rid, $run, .annotation_level, ((.title // "") | c), ((.message // "") | c)] | @tsv' | tee -a "$F"
                 done
-                if [[ "$njobs" == "0" ]] && (( nhtml < 10 )); then
+                if [[ "$label" == B* || "$concl" != "success" ]] && (( nhtml < 40 )); then
                   nhtml=$((nhtml + 1))
-                  curl -sSL --max-time 20 -A "prt-lab-collect" "$GITHUB_SERVER_URL/$repo/actions/runs/$id" 2>/dev/null \
-                    | sed 's/<[^>]*>/\n/g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-                    | grep -iE 'not allowed|pull_request_target|polic|block|annotation' \
-                    | grep -viE 'privacy|cookie|terms|security policy|copilot|enterprise-grade|^\{|^\[' \
-                    | awk 'length($0) < 400' | sort -u | head -12 \
-                    | sed "s/^/SHTML\t$rid\t$id\t/" | tee -a "$F"
+                  html "$repo" "$id" "SHTML\t$rid" | tee -a "$F"
                 fi
               done 3<<<"$samples"
             done
