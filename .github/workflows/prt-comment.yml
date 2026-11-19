@@ -5,10 +5,6 @@ name: prt-comment
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
-  # 段階 B の切り分け（一時的）: このファイルが Actions event policy の対象に入っているかを push で確かめる。
-  # push のときは pull_request が無いので、下の if でジョブは動かない。
-  push:
-    branches: [claude/project-thread-ka38w2]
 
 permissions:
   pull-requests: write
