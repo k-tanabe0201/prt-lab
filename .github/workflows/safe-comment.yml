@@ -1,0 +1,52 @@
+# 書き換え後の後半: safe-pr が終わったら、既定ブランチのこのワークフローが書き込みのトークンで PR にコメントする。
+# artifact は PR 側のコードが作ったもの（信用しないデータ）として扱い、数字だけかを確かめてから使う。
+name: safe-comment
+
+on:
+  workflow_run:
+    workflows: [safe-pr]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lab-result
+          path: ${{ runner.temp }}/lab-result
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate and comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+          EVENT_PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          dir="$RUNNER_TEMP/lab-result"
+          files=$(head -c 16 "$dir/files.txt" | tr -d '[:space:]')
+          art_pr=$(head -c 16 "$dir/pr.txt" | tr -d '[:space:]')
+          if [[ ! "$files" =~ ^[0-9]{1,6}$ || ! "$art_pr" =~ ^[0-9]{1,8}$ ]]; then
+            echo "artifact is not a number; stop"
+            exit 1
+          fi
+          # PR 番号は artifact を信用せず、head の SHA から引き直す
+          api_pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" \
+            --jq '[.[] | select(.state == "open") | .number] | first // empty')
+          echo "pr: api=$api_pr artifact=$art_pr event=${EVENT_PR:-empty}"
+          if [[ -z "$api_pr" ]]; then
+            echo "no open PR for $HEAD_SHA; stop"
+            exit 1
+          fi
+          [[ "$api_pr" == "$art_pr" ]] || echo "artifact pr differs from api pr"
+          body="<!-- lab:safe-comment --> files=$files head=${HEAD_SHA:0:7} run=$GITHUB_RUN_ID source_run=$SOURCE_RUN"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$api_pr/comments" -f body="$body" --jq '"comment_id=\(.id) created_at=\(.created_at)"'

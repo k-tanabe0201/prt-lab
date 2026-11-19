@@ -1,0 +1,201 @@
+# 記録の収集。このリポジトリの実行・ジョブ・チェック・アノテーション・PR のコメントを REST で読み、ログに TSV で出す。
+# 行頭: RATE / POL / RUN / JOB / SUITE / CHK / ANN / HTML / PR / PRC / EVT / CMT（survey=true のときは SRV / SMP / SANN / SHTML も）
+# github.event は出さない。外のリポジトリについては件数とアノテーションの文だけを出し、名前は番号（R01 など）で出す。
+name: collect
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "記録の名前（英数字）"
+        required: true
+        default: "A"
+      pr:
+        description: "PR 番号（空なら PR のコメントを取らない）"
+        required: false
+        default: ""
+      since:
+        description: "この時刻（UTC、例 2026-11-19T05:00:00Z）以降に作られた実行を集める。空なら集めない"
+        required: false
+        default: ""
+      survey:
+        description: "ブラウンアウトの調査（公開データ）をする"
+        type: boolean
+        default: false
+      windows:
+        description: "調査の時間帯（ラベル=開始..終了 をカンマ区切り。空なら既定の 5 つ）"
+        required: false
+        default: ""
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PHASE: ${{ inputs.phase }}
+      PR: ${{ inputs.pr }}
+      SINCE: ${{ inputs.since }}
+      SURVEY: ${{ inputs.survey }}
+      WINDOWS: ${{ inputs.windows }}
+    steps:
+      - name: Collect this repository
+        run: |
+          set -uo pipefail
+          echo "::stop-commands::$(uuidgen)"
+          [[ "$PHASE" =~ ^[A-Za-z0-9_-]{1,20}$ ]] || { echo "bad phase"; exit 1; }
+          [[ -z "$PR" || "$PR" =~ ^[0-9]{1,8}$ ]] || { echo "bad pr"; exit 1; }
+          [[ -z "$SINCE" || "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || { echo "bad since"; exit 1; }
+          R="$GITHUB_REPOSITORY"
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"; F="$OUT/$PHASE.tsv"
+          C='def c: tostring | gsub("[\\t\\r\\n]+"; " ") | .[0:400];'
+          rate() { gh api rate_limit --jq "\"RATE\t$1\t\(.resources.core.limit)\t\(.resources.core.remaining)\t\(.resources.core.used)\"" | tee -a "$F"; }
+          html() { # ログインなしで見える公開の実行ページから、関係しそうな文だけを抜く
+            curl -sSL --max-time 20 -A "prt-lab-collect" "$GITHUB_SERVER_URL/$R/actions/runs/$1" 2>/dev/null \
+              | sed 's/<[^>]*>/\n/g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+              | grep -iE 'not allowed|pull_request_target|polic|evaluat|block|warn|annotation' \
+              | grep -viE 'privacy|cookie|terms|security policy|copilot|enterprise-grade|^\{|^\[' \
+              | awk 'length($0) < 400' | sort -u | head -20 \
+              | sed "s/^/HTML\t$1\t/" | tee -a "$F"
+          }
+          echo "META	$PHASE	$(date -u +%Y-%m-%dT%H:%M:%SZ)	since=$SINCE	pr=$PR	image=$ImageOS/$ImageVersion	$(gh --version | head -1)" | tee -a "$F"
+          rate start
+
+          # Actions event policy の API を GITHUB_TOKEN で 1 回だけ呼ぶ（Administration の権限は付けられない）
+          gh api -i "repos/$R/actions/policies" > "$RUNNER_TEMP/pol.txt" 2> "$RUNNER_TEMP/pol.err" || true
+          pol_status=$(head -1 "$RUNNER_TEMP/pol.txt" | tr -d '\r')
+          pol_body=$(awk 'b; /^\r?$/ {b=1}' "$RUNNER_TEMP/pol.txt" | tr '\t\r\n' '   ' | head -c 1500)
+          pol_err=$(tr '\t\r\n' '   ' < "$RUNNER_TEMP/pol.err" | head -c 300)
+          printf 'POL\t%s\t%s\t%s\n' "$pol_status" "$pol_body" "$pol_err" | tee -a "$F"
+
+          if [[ -n "$SINCE" ]]; then
+            gh api -X GET --paginate "repos/$R/actions/runs" -f per_page=100 -f created=">=$SINCE" \
+              --jq '.workflow_runs[] | [.id, .name, .path, .event, .status, (.conclusion // ""), .created_at, (.run_started_at // ""), .updated_at, .head_sha, .head_branch, .check_suite_id, .run_attempt, ([.pull_requests[]?.number | tostring] | join(","))] | @tsv' \
+              | sort -n > "$RUNNER_TEMP/runs.tsv"
+            echo "runs: $(wc -l < "$RUNNER_TEMP/runs.tsv")"
+            nhtml=0
+            while IFS=$'\t' read -r -u 3 id name path event status concl created started updated hsha hbranch suite attempt prs; do
+              jobs=$(gh api "repos/$R/actions/runs/$id/jobs?filter=all&per_page=100")
+              njobs=$(jq '.total_count' <<<"$jobs")
+              dur=$(gh api "repos/$R/actions/runs/$id/timing" --jq '.run_duration_ms // ""' 2>/dev/null || echo "")
+              printf 'RUN\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$id" "$name" "$path" "$event" "$status" "$concl" "$created" "$started" "$updated" "$hsha" "$hbranch" "$suite" "$attempt" "$prs" "$njobs" "$dur" | tee -a "$F"
+              jq -r --arg run "$id" '.jobs[] | ["JOB", $run, .id, .name, .status, (.conclusion // ""), (.created_at // ""), (.started_at // ""), (.completed_at // ""), (.steps | length)] | @tsv' <<<"$jobs" | tee -a "$F"
+              gh api "repos/$R/check-suites/$suite" | jq -r --arg run "$id" "$C"' ["SUITE", $run, .id, .status, (.conclusion // ""), (.app.slug // ""), .head_sha, (.latest_check_runs_count | tostring), .created_at, .updated_at] | @tsv' | tee -a "$F"
+              chk=$(gh api "repos/$R/check-suites/$suite/check-runs?filter=all&per_page=100")
+              jq -r --arg run "$id" "$C"' .check_runs[] | ["CHK", $run, .id, (.name | c), .status, (.conclusion // ""), (.started_at // ""), (.completed_at // ""), ((.output.title // "") | c), ((.output.summary // "") | c), ((.output.text // "") | c), (.output.annotations_count | tostring)] | @tsv' <<<"$chk" | tee -a "$F"
+              for cid in $(jq -r '.check_runs[].id' <<<"$chk"); do
+                gh api "repos/$R/check-runs/$cid/annotations?per_page=100" \
+                  | jq -r --arg run "$id" --arg cid "$cid" "$C"' .[] | ["ANN", $run, $cid, .annotation_level, ((.title // "") | c), ((.message // "") | c), (.path // ""), (.start_line | tostring)] | @tsv' | tee -a "$F"
+              done
+              if [[ "$event" == "pull_request_target" || "$njobs" == "0" ]] && (( nhtml < 15 )); then
+                html "$id"; nhtml=$((nhtml + 1))
+              fi
+            done 3< "$RUNNER_TEMP/runs.tsv"
+          fi
+
+          if [[ -n "$PR" ]]; then
+            gh api "repos/$R/pulls/$PR" | jq -r '["PR", .number, .state, .created_at, (.closed_at // ""), .head.sha, .base.sha, .base.ref] | @tsv' | tee -a "$F"
+            gh api --paginate "repos/$R/pulls/$PR/commits?per_page=100" | jq -r '.[] | ["PRC", .sha, .commit.committer.date] | @tsv' | tee -a "$F"
+            gh api --paginate "repos/$R/issues/$PR/events?per_page=100" | jq -r '.[] | ["EVT", .id, .event, .created_at, (.commit_id // "")] | @tsv' | tee -a "$F"
+            gh api --paginate "repos/$R/issues/$PR/comments?per_page=100" \
+              | jq -r '.[] | select(.body | test("^<!-- lab:")) | ["CMT", .id, .created_at, .user.login,
+                  ((.body | capture("lab:(?<v>[a-z-]+) -->").v) // ""), ((.body | capture("files=(?<v>[0-9]+)").v) // ""),
+                  ((.body | capture("head=(?<v>[0-9a-f]+)").v) // ""), ((.body | capture(" run=(?<v>[0-9]+)").v) // ""),
+                  ((.body | capture("source_run=(?<v>[0-9]+)").v) // "")] | @tsv' | tee -a "$F"
+          fi
+          rate end
+
+      - name: Survey brownout (public data)
+        if: inputs.survey
+        run: |
+          set -uo pipefail
+          echo "::stop-commands::$(uuidgen)"
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"; F="$OUT/$PHASE-survey.tsv"
+          C='def c: tostring | gsub("[\\t\\r\\n]+"; " ") | .[0:400];'
+          REPOS=(nodejs/node NixOS/nixpkgs home-assistant/core DefinitelyTyped/DefinitelyTyped microsoft/vscode python/cpython
+                 flutter/flutter godotengine/godot grafana/grafana apache/airflow pytorch/pytorch vercel/next.js
+                 kubernetes/website ansible/ansible Homebrew/homebrew-core microsoft/TypeScript)
+          DEFAULT_WINDOWS="B1=2026-11-09T16:00:00Z..2026-11-09T17:59:59Z,B2=2026-11-16T16:00:00Z..2026-11-16T17:59:59Z,C1=2026-11-09T14:00:00Z..2026-11-09T15:59:59Z,C2=2026-11-16T14:00:00Z..2026-11-16T15:59:59Z,C3=2026-11-17T16:00:00Z..2026-11-17T17:59:59Z"
+          W="${WINDOWS:-$DEFAULT_WINDOWS}"
+          [[ "$W" =~ ^([A-Za-z0-9]{1,6}=[0-9TZ:-]{20}\.\.[0-9TZ:-]{20},?)+$ ]] || { echo "bad windows"; exit 1; }
+          IFS=',' read -r -a WINS <<<"$W"
+          LIMIT=700; CNT="$RUNNER_TEMP/calls"; : > "$CNT"; nhtml=0
+          calls() { wc -l < "$CNT"; }
+          MODE=token
+          if ! gh api "repos/${REPOS[0]}/actions/runs?per_page=1" > /dev/null 2> "$RUNNER_TEMP/probe.err"; then
+            MODE=none; REPOS=("${REPOS[@]:0:5}")
+          fi
+          echo x >> "$CNT"
+          echo "SMETA	mode=$MODE	repos=${#REPOS[@]}	windows=$W	probe_err=$(tr '\t\r\n' '   ' < "$RUNNER_TEMP/probe.err" | head -c 200)" | tee -a "$F"
+          api() {
+            echo x >> "$CNT"
+            if [[ "$MODE" == token ]]; then gh api "$1"; else curl -sSf --max-time 30 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"; fi
+          }
+          remaining() {
+            if [[ "$MODE" == token ]]; then gh api rate_limit --jq '.resources.core.remaining'; else curl -sS https://api.github.com/rate_limit | jq '.resources.core.remaining'; fi
+          }
+          stop_now() { (( $(calls) >= LIMIT )) && return 0; (( $(calls) % 25 == 0 )) && (( $(remaining) < 100 )) && return 0; return 1; }
+          echo "SRATE	start	$(remaining)" | tee -a "$F"
+          i=0
+          for repo in "${REPOS[@]}"; do
+            i=$((i + 1)); rid=$(printf 'R%02d' "$i")
+            for w in "${WINS[@]}"; do
+              stop_now && { echo "SSTOP	calls=$(calls)" | tee -a "$F"; break 2; }
+              label=${w%%=*}; range=${w#*=}
+              : > "$RUNNER_TEMP/win.tsv"; total=""; err=""
+              for page in 1 2 3; do
+                if ! res=$(api "repos/$repo/actions/runs?event=pull_request_target&per_page=100&page=$page&created=$range" 2> "$RUNNER_TEMP/e"); then
+                  err=$(tr '\t\r\n' '   ' < "$RUNNER_TEMP/e" | head -c 200); break
+                fi
+                total=$(jq '.total_count' <<<"$res")
+                jq -r '.workflow_runs[] | [.id, .status, (.conclusion // ""), .created_at, (.run_started_at // ""), .updated_at, .path, .check_suite_id] | @tsv' <<<"$res" >> "$RUNNER_TEMP/win.tsv"
+                (( total <= page * 100 )) && break
+              done
+              counted=$(wc -l < "$RUNNER_TEMP/win.tsv")
+              dist=$(cut -f2,3 "$RUNNER_TEMP/win.tsv" | awk -F'\t' '{k=$1 "/" ($2 == "" ? "-" : $2); n[k]++} END {for (k in n) printf "%s:%d,", k, n[k]}' | sed 's/,$//')
+              printf 'SRV\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rid" "$label" "${total:-}" "$counted" "${dist:-}" "$err" | tee -a "$F"
+              # 見本: ブラウンアウト（B）は成功以外を最大 3 件、他は 1 件
+              if [[ "$label" == B* ]]; then
+                samples=$(awk -F'\t' '$3 != "success" && $3 != "skipped"' "$RUNNER_TEMP/win.tsv" | head -3)
+                [[ -n "$samples" ]] || samples=$(head -1 "$RUNNER_TEMP/win.tsv")
+              else
+                samples=$(awk -F'\t' '$3 != "skipped"' "$RUNNER_TEMP/win.tsv" | head -1)
+              fi
+              [[ -n "$samples" ]] || continue
+              while IFS=$'\t' read -r -u 3 id status concl created started updated path suite; do
+                stop_now && break
+                njobs=$(api "repos/$repo/actions/runs/$id/jobs?filter=all&per_page=100" | jq '.total_count' 2>/dev/null || echo "?")
+                printf 'SMP\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rid" "$label" "$id" "$status" "$concl" "$created" "$started" "$updated" "$njobs" "$path" | tee -a "$F"
+                chk=$(api "repos/$repo/check-suites/$suite/check-runs?filter=all&per_page=100" 2>/dev/null || echo '{"check_runs":[]}')
+                jq -r --arg rid "$rid" --arg run "$id" "$C"' .check_runs[] | ["SCHK", $rid, $run, .status, (.conclusion // ""), ((.output.title // "") | c), ((.output.summary // "") | c), (.output.annotations_count | tostring)] | @tsv' <<<"$chk" | tee -a "$F"
+                for cid in $(jq -r '.check_runs[] | select(.output.annotations_count > 0) | .id' <<<"$chk" | head -2); do
+                  api "repos/$repo/check-runs/$cid/annotations?per_page=50" 2>/dev/null \
+                    | jq -r --arg rid "$rid" --arg run "$id" "$C"' .[] | ["SANN", $rid, $run, .annotation_level, ((.title // "") | c), ((.message // "") | c)] | @tsv' | tee -a "$F"
+                done
+                if [[ "$njobs" == "0" ]] && (( nhtml < 10 )); then
+                  nhtml=$((nhtml + 1))
+                  curl -sSL --max-time 20 -A "prt-lab-collect" "$GITHUB_SERVER_URL/$repo/actions/runs/$id" 2>/dev/null \
+                    | sed 's/<[^>]*>/\n/g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+                    | grep -iE 'not allowed|pull_request_target|polic|block|annotation' \
+                    | grep -viE 'privacy|cookie|terms|security policy|copilot|enterprise-grade|^\{|^\[' \
+                    | awk 'length($0) < 400' | sort -u | head -12 \
+                    | sed "s/^/SHTML\t$rid\t$id\t/" | tee -a "$F"
+                fi
+              done 3<<<"$samples"
+            done
+          done
+          echo "SRATE	end	$(remaining)	calls=$(calls)" | tee -a "$F"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: collect-${{ inputs.phase }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 14

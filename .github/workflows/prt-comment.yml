@@ -1,0 +1,40 @@
+# 書き換え前の典型: pull_request_target で、PR の変更ファイル数を数えて PR にコメントする。
+# PR のコードは checkout しない。PR のタイトルやブランチ名は使わない（使うのは番号と SHA だけ）。
+name: prt-comment
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  comment:
+    # 他人の PR では手順を動かさない（実行そのものは作られる）
+    if: github.event.pull_request.user.login == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Show context
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          ACTION: ${{ github.event.action }}
+        run: |
+          echo "event=$GITHUB_EVENT_NAME action=$ACTION"
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "pr=$PR_NUMBER head_sha=$HEAD_SHA head_is_fork=$HEAD_IS_FORK"
+          echo "image=$ImageOS/$ImageVersion"
+
+      - name: Comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' | wc -l)
+          body="<!-- lab:prt-comment --> files=$files head=${HEAD_SHA:0:7} run=$GITHUB_RUN_ID"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$body" --jq '"comment_id=\(.id) created_at=\(.created_at)"'
